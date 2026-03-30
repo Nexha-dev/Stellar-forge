@@ -49,6 +49,10 @@ pub struct TokenInfo {
     pub max_supply: Option<i128>,
 }
 
+/// Current schema version written by `initialize` and bumped by `migrate`.
+/// Increment this constant whenever `FactoryState` gains new fields.
+pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+
 #[contracttype]
 #[derive(Clone)]
 pub struct FactoryState {
@@ -62,6 +66,9 @@ pub struct FactoryState {
     pub metadata_fee: i128,
     pub token_wasm_hash: BytesN<32>,
     pub token_count: u32,
+    /// Schema version of this state struct. Used by `migrate` to apply
+    /// incremental upgrades without data loss.
+    pub schema_version: u32,
 }
 </xai:function_call }
 
@@ -128,6 +135,7 @@ impl TokenFactory {
             base_fee,
             metadata_fee,
             token_count: 0,
+            schema_version: CURRENT_SCHEMA_VERSION,
         };
 
         env.storage().instance().set(&DataKey::State, &state);
@@ -174,6 +182,34 @@ impl TokenFactory {
 
     fn extend_token_ttl(env: &Env, _token_address: &Address, _index: u32) {
         env.storage().instance().extend_ttl(MIN_TTL, MAX_TTL);
+    }
+
+    fn whitelist_key(address: &Address) -> (soroban_sdk::Symbol, Address) {
+        (symbol_short!("wl"), address.clone())
+    }
+
+    pub fn add_to_whitelist(env: Env, admin: Address, address: Address) -> Result<(), Error> {
+        admin.require_auth();
+        let state = Self::load_state(&env)?;
+        if state.admin != admin {
+            return Err(Error::Unauthorized);
+        }
+        env.storage().instance().set(&Self::whitelist_key(&address), &true);
+        Ok(())
+    }
+
+    pub fn remove_from_whitelist(env: Env, admin: Address, address: Address) -> Result<(), Error> {
+        admin.require_auth();
+        let state = Self::load_state(&env)?;
+        if state.admin != admin {
+            return Err(Error::Unauthorized);
+        }
+        env.storage().instance().remove(&Self::whitelist_key(&address));
+        Ok(())
+    }
+
+    pub fn is_whitelisted(env: Env, address: Address) -> bool {
+        env.storage().instance().get(&Self::whitelist_key(&address)).unwrap_or(false)
     }
 
     fn require_not_paused(env: &Env) -> Result<(), Error> {
