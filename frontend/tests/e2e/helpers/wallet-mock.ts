@@ -1,4 +1,4 @@
-import { Page } from '@playwright/test';
+import { Page } from '@playwright/test'
 
 export interface FreighterMock {
   isConnected: () => Promise<{ isConnected: boolean }>
@@ -15,20 +15,92 @@ declare global {
 }
 
 /**
- * Mocks the Freighter wallet API on the window object.
+ * Mocks the Freighter wallet browser extension on the page.
+ *
+ * @stellar/freighter-api v6.0.1 uses two mechanisms:
+ *   1. window.freighter presence check (isConnected shortcircuits to truthy when set)
+ *   2. postMessage protocol (FREIGHTER_EXTERNAL_MSG_REQUEST / RESPONSE) for getAddress,
+ *      signTransaction, REQUEST_NETWORK_DETAILS, etc.
+ *
+ * We intercept both so the app sees a fully connected wallet without the real extension.
+ * ToS is pre-accepted via localStorage so the modal does not block connect().
  */
 export async function mockFreighter(page: Page, address: string) {
   await page.addInitScript((mockAddress: string) => {
-    // Mock the global freighter object if needed,
-    // but @stellar/freighter-api actually uses window.freighter or similar internally.
-    // We can also mock the individual functions if they are exported from a module.
-    // However, since we are testing the built app, we need to mock what the library expects.
+    // Pre-accept Terms of Service so the modal doesn't block wallet connection
+    localStorage.setItem('stellar_forge_tos_accepted', 'true')
+
+    // Set window.freighter so isConnected() returns {isConnected: <truthy>} immediately
     window.freighter = {
       isConnected: () => Promise.resolve({ isConnected: true }),
       getAddress: () => Promise.resolve({ address: mockAddress }),
       requestAccess: () => Promise.resolve({ address: mockAddress }),
-      signTransaction: (xdr: string) => Promise.resolve({ signedTxXdr: xdr }), // Return unsigned for simplicity in mock
-      getNetwork: () => Promise.resolve({ network: 'TESTNET' }),
-    };
-  }, address);
+      signTransaction: (xdr: string) => Promise.resolve({ signedTxXdr: xdr }),
+      getNetwork: () => Promise.resolve({ network: 'STANDALONE' }),
+    }
+
+    // Intercept the postMessage protocol used by freighter-api for getAddress(),
+    // signTransaction(), REQUEST_NETWORK_DETAILS, etc.
+    // Request format:  { source: 'FREIGHTER_EXTERNAL_MSG_REQUEST', messageId: number, type: string, ... }
+    // Response format: { source: 'FREIGHTER_EXTERNAL_MSG_RESPONSE', messagedId: number, ... }
+    // Note: 'messagedId' (with trailing 'd') is the Freighter library's key name.
+    window.addEventListener('message', (event) => {
+      const data = event.data as Record<string, unknown>
+      if (!data || data['source'] !== 'FREIGHTER_EXTERNAL_MSG_REQUEST') return
+
+      const messageId = data['messageId']
+      const type = data['type'] as string
+
+      const base: Record<string, unknown> = {
+        source: 'FREIGHTER_EXTERNAL_MSG_RESPONSE',
+        messagedId: messageId,
+      }
+
+      switch (type) {
+        case 'REQUEST_CONNECTION_STATUS':
+          window.postMessage({ ...base, isConnected: true }, '*')
+          break
+        case 'REQUEST_PUBLIC_KEY':
+          window.postMessage({ ...base, publicKey: mockAddress }, '*')
+          break
+        case 'REQUEST_ACCESS':
+          window.postMessage({ ...base, publicKey: mockAddress }, '*')
+          break
+        case 'REQUEST_NETWORK_DETAILS':
+          window.postMessage(
+            {
+              ...base,
+              networkDetails: {
+                network: 'STANDALONE',
+                networkName: 'Standalone',
+                networkUrl: 'http://localhost:8000',
+                networkPassphrase: 'Standalone Network ; February 2017',
+                sorobanRpcUrl: 'http://localhost:8000/soroban/rpc',
+              },
+            },
+            '*',
+          )
+          break
+        case 'REQUEST_ALLOWED_STATUS':
+          window.postMessage({ ...base, isAllowed: true }, '*')
+          break
+        case 'SET_ALLOWED_STATUS':
+          window.postMessage({ ...base, isAllowed: true }, '*')
+          break
+        case 'SUBMIT_TRANSACTION':
+          window.postMessage(
+            {
+              ...base,
+              signedTransaction: data['transactionXdr'],
+              signerAddress: mockAddress,
+            },
+            '*',
+          )
+          break
+        default:
+          // Don't respond to unknown message types
+          break
+      }
+    })
+  }, address)
 }
