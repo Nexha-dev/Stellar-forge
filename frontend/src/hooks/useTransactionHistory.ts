@@ -75,7 +75,9 @@ export function useTransactionHistory(
           .map((op: HorizonOperationRecord) => parseOperation(op, options))
           .filter((item: TransactionHistoryItem | null) => item !== null)
         cacheRef.current[cacheKey] = items
-        setTransactions((prev: TransactionHistoryItem[]) => (reset ? items : [...prev, ...items]))
+        setTransactions((prev: TransactionHistoryItem[]) =>
+          reset ? items : [...prev, ...items],
+        )
         setHasMore(items.length === pageSize)
         setLastUpdated(new Date())
       } catch (e) {
@@ -163,7 +165,11 @@ function parseOperation(
   let type: TransactionType = 'other'
   let token = ''
   let amount = ''
-  if (op.type === 'manage_data' && op.name && op.name.toLowerCase().includes('token')) {
+  if (
+    op.type === 'manage_data' &&
+    op.name &&
+    op.name.toLowerCase().includes('token')
+  ) {
     type = 'create'
     token = op.name
   } else if (op.type === 'payment' && op.asset_code && op.amount) {
@@ -181,8 +187,14 @@ function parseOperation(
     token = op.asset_code
   }
   // Optionally filter by assetCodes, issuer, contractIds
-  if (options.assetCodes && token && !options.assetCodes.includes(token)) return null
-  if (options.issuer && op.asset_issuer && op.asset_issuer !== options.issuer) return null
+  if (
+    options.assetCodes &&
+    token &&
+    !options.assetCodes.includes(token)
+  )
+    return null
+  if (options.issuer && op.asset_issuer && op.asset_issuer !== options.issuer)
+    return null
   // Add more contractId logic if needed
   if (type === 'other') return null
   return {
