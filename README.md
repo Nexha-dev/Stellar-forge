@@ -6,15 +6,70 @@ StellarForge is a user-friendly decentralized application (dApp) that enables cr
 
 ## Features
 
-- **Token Factory Contract**: Deploy custom tokens on Stellar using Soroban smart contracts
-- **Fee-Based System**: Configurable fees for token creation, metadata setting, and minting
-- **IPFS Integration**: Store token metadata (images, descriptions) on IPFS via Pinata
-- **Wallet Integration**: Connect with Freighter wallet for seamless transactions
-- **Burn Functionality**: Burn tokens to reduce supply
-- **Admin Controls**: Update fees and manage the factory
-- **Network Switcher**: Toggle between testnet and mainnet from the UI
-- **Transaction History**: View on-chain contract events with pagination
-- **Testnet & Mainnet Support**: Deploy on both testnet and mainnet
+- **Token Factory Contract**: Deploy custom SEP-41 tokens on Stellar using a single Soroban smart contract, without writing or auditing your own contract code
+- **Single & Batch Token Creation**: Deploy one token per transaction, or atomically deploy multiple tokens in a single `create_tokens_batch` call
+- **Fee-Based System**: Configurable, admin-adjustable fees for token creation, metadata setting, and minting, paid in a dedicated SEP-41 fee token (typically native XLM)
+- **Fee Splitting**: Route a percentage (in basis points) of every collected fee to multiple recipients instead of a single treasury address
+- **Max Supply Caps**: Optionally cap a token's total mintable supply at creation time (batch path); further `mint_tokens` calls are rejected once the cap would be exceeded
+- **IPFS Integration**: Store token metadata (images, descriptions) on IPFS via Pinata, referenced on-chain by a single `ipfs://` URI
+- **Wallet Integration**: Connect with the Freighter wallet extension for account discovery and transaction signing
+- **Burn Functionality**: Token holders can burn their own balance; each token has a per-token `burn_enabled` flag an admin can toggle off
+- **Admin Controls**: Update fees, pause/unpause the factory, rotate the admin address, and upgrade the contract's WASM in place
+- **Network Mismatch Protection**: Writes are blocked in the UI whenever the connected Freighter network differs from the app's selected network, preventing accidental cross-network signing
+- **Network Switcher**: Toggle between testnet and mainnet from the UI, each with its own contract ID, RPC endpoint, and explorer links
+- **Transaction History**: View on-chain contract events (token creation, mint, burn, metadata, fee changes) with pagination and CSV export
+- **Contract Upgradability**: In-place WASM upgrades with an idempotent, versioned state-migration path (`schema_version` + `migrate`) that preserves all existing tokens, fees, and admin state
+- **Testnet & Mainnet Support**: The same frontend build supports both networks via environment configuration, with an explicit confirmation modal before mainnet-destructive actions
+
+## How StellarForge Works
+
+StellarForge is built around one on-chain "factory" contract that deploys and administers many independent token contracts, plus a React frontend that talks directly to Stellar — there is no StellarForge backend server and no database. Every piece of durable state (tokens, balances, fees, metadata pointers) lives on the Stellar ledger; the frontend is a thin, stateless client that reads and writes it.
+
+### 1. The factory pattern
+
+The `token-factory` Soroban contract (`contracts/token-factory/src/lib.rs`) is deployed once per network (one factory on testnet, one on mainnet). It does not implement token logic itself — instead it:
+
+1. Holds a `token_wasm_hash`: the hash of a separately-deployed, audited SEP-41 token contract WASM.
+2. On `create_token`, uses Soroban's deterministic deployer (`env.deployer().with_address(creator, salt)`) to instantiate a **new, independent contract instance** of that WASM, owned at an address derived from `(creator, salt)`.
+3. Initializes the new token contract with the requested `name`, `symbol`, and `decimals`, and optionally mints the caller an `initial_supply`.
+4. Records bookkeeping for the new token in its own storage: a `TokenInfo` record (name, symbol, decimals, creator, timestamp, burn flag, optional max supply), a reverse `token_address → index` lookup, and an append-only `creator → [indices]` list for "my tokens" queries.
+
+Every token deployed this way is a fully standalone contract on the ledger — it can be transferred, held, and queried through the standard SEP-41 interface by any Stellar wallet or tool, independent of StellarForge.
+
+### 2. The fee model
+
+Every mutating factory call that has a monetary cost (`create_token`, `create_tokens_batch`, `mint_tokens`, `set_metadata`) requires the caller to pass a `fee_payment` argument and pre-authorize a transfer of that amount in the factory's configured `fee_token` (a SEP-41 asset — usually native XLM). The factory:
+
+- Rejects the call with `Error::InsufficientFee` if `fee_payment` is below the current `base_fee` (or `base_fee * token_count` for batch creation) or `metadata_fee`.
+- Transfers the fee from the caller either straight to a single `treasury` address, or — if the admin has configured a **fee split** via `set_fee_split` — proportionally across multiple recipients by basis points (parts per 10,000), with any rounding remainder going to `treasury`.
+- Lets the admin retune `base_fee` and `metadata_fee` at any time via `update_fees`, without redeploying.
+
+### 3. Metadata: on-chain pointer, off-chain payload
+
+Token images and descriptions are too large and mutable to store cheaply on a Soroban ledger, so StellarForge splits metadata into two layers:
+
+1. **Off-chain payload** — the frontend uploads the image and a JSON document (`{ name, description, image }`) to IPFS through Pinata's pinning API, getting back a content identifier (CID) for each.
+2. **On-chain pointer** — `set_metadata(token_address, admin, metadata_uri, fee_payment)` stores a single `ipfs://<cid>` string against the token, one time only (`Error::MetadataAlreadySet` on a second attempt). Any client — StellarForge's UI, a block explorer, another dApp — can resolve that URI through any IPFS gateway to fetch the same image/description.
+
+### 4. Administration, safety, and lifecycle controls
+
+- **Pause switch** — `pause`/`unpause` let the admin halt `create_token`, `create_tokens_batch`, `mint_tokens`, and `set_metadata` factory-wide in an emergency. `burn` intentionally ignores the pause flag, since token holders should always be able to reduce their own balance.
+- **Reentrancy guard** — a `locked` flag on `FactoryState` prevents a second `create_token`/`create_tokens_batch` call from interleaving with one already in progress in the same transaction context.
+- **Per-token burn toggle** — `set_burn_enabled` lets a token's creator disable burning for that token specifically (e.g. for a fixed-supply asset), independent of the factory-wide pause.
+- **Allow-list primitives** — `add_to_whitelist` / `remove_from_whitelist` / `is_whitelisted` maintain an admin-managed address allow-list in factory storage. (These are currently standalone storage primitives; no factory entrypoint gates on them yet — see the project issue tracker for the tracked follow-up to wire enforcement into `create_token`.)
+- **Admin rotation** — `transfer_admin` / `update_admin` move admin privileges to a new address (both perform the same underlying state change; `update_admin` additionally emits an `adm_upd` event).
+- **Upgrade + migrate** — `upgrade` swaps the contract's executable WASM in place; `migrate` is an idempotent, versioned function (`schema_version` vs. `CURRENT_SCHEMA_VERSION`) that brings on-chain state up to date with the currently-deployed code without ever losing existing tokens or fee configuration. See [Contract Upgrade Process](#contract-upgrade-process) below.
+
+### 5. The frontend's role
+
+The React app (`frontend/src`) is organized in layers so that UI code never talks to the network directly:
+
+- **`services/`** — the only layer that touches the outside world: `stellar.ts` / `stellar-impl.ts` build, sign-request, submit, and poll Soroban transactions and parse contract events; `ipfs.ts` uploads to and reads from Pinata; `wallet.ts` wraps the Freighter browser extension API.
+- **`context/`** — app-wide React state: `WalletContext` (connected account, signing), `NetworkContext` (testnet/mainnet selection, persisted to `localStorage`, cross-checked against Freighter's actual network via `useNetworkMismatch`), `ToastContext`, `DarkModeContext`, `TosContext`.
+- **`hooks/`** — data-fetching and derived state built on the services layer: `useTokens` (cached, paginated token listings), `useTransaction`/`useTransactionPolling` (submit-and-poll a signed transaction), `useFactoryState`, `useTokenBalance`, `useTransactionHistory`, and more.
+- **`components/`** — presentation and forms (`CreateToken`, `MintForm`, `BurnForm`, `SetMetadataForm`, `AdminPanel`, `TokenExplorer`, `TokenDashboard`, `TransactionHistory`, …) that compose hooks and services but hold no blockchain logic of their own.
+
+Because all state lives on-chain (or on IPFS), the frontend can be redeployed, pointed at a different factory contract ID, or replaced entirely without any data migration — it is purely a view over the Stellar ledger.
 
 ## Tech Stack
 
@@ -171,40 +226,53 @@ npm run lint         # Lint code
 
 ## Contract Functions
 
+The authoritative, field-by-field reference — including parameter tables, every error code, and every emitted event — lives in [`docs/contract-abi.md`](./docs/contract-abi.md). This section is a quick-scan summary of the same `#[contractimpl]` surface in `contracts/token-factory/src/lib.rs`.
+
 ### Initialization
+- `initialize(admin, treasury, fee_token, token_wasm_hash, base_fee, metadata_fee)`: One-time factory setup. Fails with `AlreadyInitialized` on retry.
 
-- `initialize(admin, treasury, base_fee, metadata_fee)`: Set up the factory with admin controls and fees
-
-### Token Operations
-
-- `create_token(creator, name, symbol, decimals, initial_supply, fee_payment)`: Deploy a new token
-- `mint_tokens(token_address, admin, to, amount, fee_payment)`: Mint additional tokens
-- `burn(token_address, from, amount)`: Burn tokens from supply
+### Token Lifecycle
+- `create_token(creator, salt, name, symbol, decimals, initial_supply, fee_payment)`: Deploy a single new token contract at a deterministic `(creator, salt)` address; optionally mint `initial_supply` to `creator`.
+- `create_tokens_batch(creator, tokens, fee_payment)`: Atomically deploy a `Vec<BatchTokenParams>` (each with its own name/symbol/decimals/initial_supply and optional `max_supply` cap) in one transaction. `fee_payment` must cover `base_fee * tokens.len()`; a failure partway through the batch aborts the whole call.
+- `mint_tokens(token_address, admin, to, amount, fee_payment)`: Mint additional supply. Only the token's original creator may call this. Rejected with `MaxSupplyExceeded` if the token was created with a `max_supply` cap that minting would exceed.
+- `burn(token_address, from, amount)`: Burn `amount` from the caller's own balance. Honors the token's `burn_enabled` flag; ignores the factory-wide pause.
 
 ### Metadata
+- `set_metadata(token_address, admin, metadata_uri, fee_payment)`: Attach an `ipfs://` (or `https://`) metadata URI to a token. One-shot — a second call returns `MetadataAlreadySet`.
+- `set_burn_enabled(token_address, admin, enabled)`: Toggle whether a specific token can be burned. Caller must be the token's creator.
 
-- `set_metadata(token_address, admin, metadata_uri, fee_payment)`: Set token metadata URI
-
-### Admin Functions
-
-- `update_fees(admin, base_fee?, metadata_fee?)`: Update factory fees
-- `pause(admin)` / `unpause(admin)`: Pause or resume the factory
+### Admin & Governance
+- `update_fees(admin, base_fee?, metadata_fee?)`: Adjust either fee; `None` leaves it unchanged.
+- `set_fee_split(admin, splits)` / `get_fee_split()`: Configure or read a `Map<Address, u32>` of basis-point fee recipients (must sum to `10_000`, or be empty to clear the split and fall back to `treasury`).
+- `pause(admin)` / `unpause(admin)`: Halt or resume `create_token`, `create_tokens_batch`, `mint_tokens`, and `set_metadata` factory-wide.
+- `add_to_whitelist(admin, address)` / `remove_from_whitelist(admin, address)` / `is_whitelisted(address)`: Maintain an admin-managed address allow-list in contract storage (not currently enforced by any entrypoint — see the issue tracker).
+- `transfer_admin(admin, new_admin)` / `update_admin(current_admin, new_admin)`: Rotate the admin address. Equivalent effect; `update_admin` additionally emits an `adm_upd` event.
+- `upgrade(admin, new_wasm_hash)`: Replace the factory's executable WASM in place, preserving all state. See [Contract Upgrade Process](#contract-upgrade-process).
+- `migrate(admin)`: Idempotently bring on-chain state up to `CURRENT_SCHEMA_VERSION` after an upgrade.
 
 ### View Functions
+- `get_state()`: Full `FactoryState` (admin, treasury, fee_token, fees, pause flag, token count, schema version).
+- `get_base_fee()` / `get_metadata_fee()`: Current fee values.
+- `get_token_info(index)`: Look up a token by its 1-based factory index.
+- `get_tokens_by_creator(creator, offset, limit)`: Paginated slice of token indices created by a given address. The contract caps `limit` at `MAX_TOKENS_BY_CREATOR_PAGE` (currently 50) per call, so list iteration should advance `offset` by the previous page's length until a short page is returned. The frontend's `fetchAllTokensByCreator` helper (`frontend/src/hooks/useTokens.ts`) does this loop automatically.
 
-- `get_state()`: Get factory state
-- `get_base_fee()`: Get token creation fee
-- `get_metadata_fee()`: Get metadata setting fee
-- `get_token_info(index)`: Get token information by index
-- `get_tokens_by_creator(creator, offset, limit)`: Get a paginated slice of token indices created by a given address. The contract caps `limit` at `MAX_TOKENS_BY_CREATOR_PAGE` (currently 50) per call, so list iteration should advance `offset` by the previous page's length until a short page is returned. See [`docs/contract-abi.md`](./docs/contract-abi.md).
+### Errors
+
+All fallible entrypoints return `Result<T, Error>`. See the full table (17 variants, e.g. `InsufficientFee`, `Unauthorized`, `ContractPaused`, `MaxSupplyExceeded`, `InvalidFeeSplit`) in [`docs/contract-abi.md`](./docs/contract-abi.md#errors).
+
+### Events
+
+The contract publishes Soroban events on `(factory, action)` topics — `init`, `created`, `meta`, `mint`, `burn`, `fees`, `pause`, `unpause`, `adm_upd` — parsed by the frontend in `frontend/src/services/stellar-impl.ts` and rendered in the Transaction History view. See [`docs/contract-abi.md`](./docs/contract-abi.md#events) for the exact payload of each.
 
 ## Usage
 
-1. **Connect Wallet**: Use Freighter wallet to connect to the dApp
-2. **Create Token**: Fill in token details (name, symbol, decimals, supply) and pay the creation fee
-3. **Set Metadata**: Upload token image and description to IPFS
-4. **Mint Tokens**: Mint additional tokens as needed
-5. **Manage Supply**: Burn tokens to reduce circulating supply
+1. **Connect Wallet**: Use the Freighter browser extension to connect an account. The app checks that Freighter's active network matches the app's selected network and blocks writes on mismatch.
+2. **Create Token**: Fill in name, symbol, decimals, and initial supply; the form validates against the same rules the contract enforces (name ≤ 32 chars, symbol ≤ 12 chars, decimals 0–18) before submission. Sign and submit the transaction to pay the creation fee and deploy the token contract.
+3. **Set Metadata**: Upload a token image and description — the app uploads the image to IPFS, pins a metadata JSON document referencing it, then calls `set_metadata` with the resulting `ipfs://` URI (one-time only per token).
+4. **Mint Tokens**: As the token's creator, mint additional supply to any address, subject to the token's optional `max_supply` cap.
+5. **Manage Supply**: Token holders can burn their own balance at any time (unless the creator has disabled burning for that token via `set_burn_enabled`).
+6. **Admin Panel**: The factory admin can update fees, configure a fee split, pause/unpause the factory, and rotate the admin address from the in-app Admin Panel.
+7. **Explore & Export**: Browse all deployed tokens or a specific creator's tokens in the Token Explorer/Dashboard, and export transaction history to CSV.
 
 ## Deployment
 
@@ -332,17 +400,18 @@ stellar contract invoke \
   --admin $ADMIN_ADDRESS \
   --treasury $ADMIN_ADDRESS \
   --fee_token <NATIVE_XLM_CONTRACT_ADDRESS> \
+  --token_wasm_hash <TOKEN_WASM_HASH_FROM_STEP_4> \
   --base_fee 100000000 \
   --metadata_fee 50000000
 ```
 
 **Parameters explained:**
-
-- `admin`: Address that can update fees and pause the factory
-- `treasury`: Address that receives fees from token creation
-- `fee_token`: Contract address for the fee token (use native XLM contract: `CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC`)
-- `base_fee`: Fee for creating a token (in stroops, 1 XLM = 10,000,000 stroops)
-- `metadata_fee`: Fee for setting token metadata
+- `admin`: Address that can update fees, pause the factory, manage the whitelist and fee split, rotate the admin, and upgrade the contract
+- `treasury`: Default address that receives fees from token creation (overridden per-recipient if a fee split is configured)
+- `fee_token`: Contract address for the SEP-41 token used to pay all fees (use native XLM contract: `CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC`)
+- `token_wasm_hash`: The WASM hash uploaded in Step 4 — every token the factory deploys is an instance of this code
+- `base_fee`: Fee for `create_token` / `mint_tokens` / each token in `create_tokens_batch` (in stroops, 1 XLM = 10,000,000 stroops)
+- `metadata_fee`: Fee for `set_metadata`
 
 #### Step 6: Configure Frontend
 
